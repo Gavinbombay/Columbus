@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 class DriverError(Exception):
@@ -23,15 +24,18 @@ class JobSpec:
     gpu_count: int = 1
     cloud_type: str = "COMMUNITY"  # COMMUNITY or SECURE
     image: str = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"
+    command: str = ""
     docker_args: str = ""
     container_disk_gb: int = 20
     volume_gb: int = 0
     network_volume_id: Optional[str] = None
     env: Dict[str, str] = field(default_factory=dict)
+    files_out: Tuple[str, ...] = ()
     endpoint_id: str = ""
     payload: Dict[str, Any] = field(default_factory=dict)
     max_usd: float = 0.50
     max_walltime_secs: int = 600
+    startup_timeout_secs: int = 420
     idle_timeout_secs: int = 300
     requesting_agent: str = "agent"
 
@@ -43,15 +47,18 @@ class JobSpec:
             "gpu_count": self.gpu_count,
             "cloud_type": self.cloud_type,
             "image": self.image,
+            "command": self.command,
             "docker_args": self.docker_args,
             "container_disk_gb": self.container_disk_gb,
             "volume_gb": self.volume_gb,
             "network_volume_id": self.network_volume_id,
             "env": dict(sorted(self.env.items())),
+            "files_out": list(self.files_out),
             "endpoint_id": self.endpoint_id,
             "payload": self.payload,
             "max_usd": round(float(self.max_usd), 6),
             "max_walltime_secs": int(self.max_walltime_secs),
+            "startup_timeout_secs": int(self.startup_timeout_secs),
             "idle_timeout_secs": int(self.idle_timeout_secs),
         }
 
@@ -95,6 +102,17 @@ class PollResult:
     output: Any = None
     error: str = ""
     uptime_secs: int = 0
+    ssh_endpoint: Optional[Tuple[str, int]] = None
+
+
+@dataclass(frozen=True)
+class ExecResult:
+    state: str  # "completed", "failed", "idle_timeout", "timed_out", "cancelled"
+    exit_code: Optional[int] = None
+    stdout: str = ""
+    stderr: str = ""
+    error: str = ""
+    files_out_bytes: Dict[str, bytes] = field(default_factory=dict)
 
 
 class ProviderDriver(ABC):
@@ -115,12 +133,23 @@ class ProviderDriver(ABC):
         """Return ONLY resources whose name starts with prefix."""
 
     @abstractmethod
-    def create(self, spec: JobSpec, owned_name: str) -> LaunchResult:
+    def create(self, spec: JobSpec, owned_name: str, ssh_public_key: Optional[str] = None) -> LaunchResult:
         """Provision a pod or submit a serverless job tagged with owned_name."""
 
     @abstractmethod
     def poll(self, resource_id: str, spec: JobSpec) -> PollResult:
-        """Poll execution status and progress."""
+        """Poll execution status, progress, and SSH readiness."""
+
+    @abstractmethod
+    def run_pod_command(
+        self,
+        ssh_endpoint: Tuple[str, int],
+        private_key_path: Path,
+        spec: JobSpec,
+        walltime_remaining_secs: float,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> ExecResult:
+        """Execute spec.command over ephemeral SSH and collect bounded outputs."""
 
     @abstractmethod
     def terminate(self, resource_id: str, spec: JobSpec) -> None:

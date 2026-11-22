@@ -244,3 +244,49 @@ class ColumbusControllerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ColumbusEphemeralSshTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.key_file = self.root / "runpod_api_key"
+        self.key_file.write_text("fake_key_ssh_000000\n", encoding="utf-8")
+        os.chmod(self.key_file, 0o600)
+        self.clock = FakeClock()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_ephemeral_ssh_pod_command_and_cleanup(self) -> None:
+        drv = FakeRunPodDriver(balance_usd=6.88, key_file=self.key_file)
+        cfg = LaneConfig(
+            lane_id="columbus-runpod",
+            state_root=self.root / "state",
+            budget_cap_usd=6.88,
+            job_poll_secs=1.0,
+        )
+        ctrl = ColumbusController(cfg, drv, clock=self.clock, sleeper=self.clock.sleep)
+        req = {
+            "action": "stage",
+            "mode": "pod",
+            "gpu_type": "NVIDIA RTX A4000",
+            "command": "nvidia-smi && echo COLUMBUS_SMOKE_OK",
+            "max_walltime_secs": 300,
+            "startup_timeout_secs": 180,
+            "max_usd": 0.10,
+        }
+        staged = ctrl.handle(req)
+        self.assertTrue(staged["ok"], staged)
+        ctrl.approvals.approve(staged["ticket_id"])
+        res = ctrl.handle(dict(req, action="exec", ticket_id=staged["ticket_id"]))
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["exit_code"], 0)
+        self.assertIn("COLUMBUS_SMOKE_OK", res["stdout_preview"])
+        self.assertTrue(drv.create_calls[0]["has_ssh_key"])
+        self.assertEqual(len(drv.exec_calls), 1)
+        self.assertTrue(drv.exec_calls[0]["key_exists"])
+        self.assertEqual(len(drv.terminate_calls), 1)
+        # Verify temp ssh-* dir was cleaned up
+        ssh_dirs = list((self.root / "state" / "columbus-runpod").glob("ssh-*"))
+        self.assertEqual(ssh_dirs, [])

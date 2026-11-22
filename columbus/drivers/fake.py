@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from columbus.drivers.base import (
     CostEstimate,
     DriverError,
+    ExecResult,
     JobSpec,
     LaunchResult,
     OwnedResource,
@@ -33,6 +34,7 @@ class FakeRunPodDriver(ProviderDriver):
         fail_terminate: bool = False,
         leave_orphan_after_terminate: bool = False,
         poll_sequence: Optional[List[PollResult]] = None,
+        exec_result: Optional[ExecResult] = None,
         cost_per_run_usd: float = 0.05,
     ) -> None:
         self.balance_usd = balance_usd
@@ -45,11 +47,18 @@ class FakeRunPodDriver(ProviderDriver):
         self.fail_terminate = fail_terminate
         self.leave_orphan_after_terminate = leave_orphan_after_terminate
         self.poll_sequence = list(poll_sequence) if poll_sequence is not None else [
-            PollResult(state="running", progress_token="run-1", uptime_secs=5),
-            PollResult(state="completed", progress_token="done-1", output={"ok": True, "gpu": "RTX 4090"}, uptime_secs=12),
+            PollResult(state="running", progress_token="run-1", uptime_secs=5, ssh_endpoint=("203.0.113.10", 22022)),
+            PollResult(state="completed", progress_token="done-1", output={"ok": True, "gpu": "RTX 4090"}, uptime_secs=12, ssh_endpoint=("203.0.113.10", 22022)),
         ]
+        self.exec_result = exec_result or ExecResult(
+            state="completed",
+            exit_code=0,
+            stdout="NVIDIA RTX A4000, 16384 MiB\nCOLUMBUS_SMOKE_OK\n",
+            stderr="",
+        )
         self.cost_per_run_usd = cost_per_run_usd
         self.create_calls: List[Dict[str, Any]] = []
+        self.exec_calls: List[Dict[str, Any]] = []
         self.terminate_calls: List[str] = []
         self.keys_seen: List[str] = []
         self._seq = 0
@@ -81,9 +90,19 @@ class FakeRunPodDriver(ProviderDriver):
             raise DriverError("invalid_owned_prefix")
         return [p for p in self.pods.values() if p.name.startswith(prefix)]
 
-    def create(self, spec: JobSpec, owned_name: str) -> LaunchResult:
+    def create(
+        self,
+        spec: JobSpec,
+        owned_name: str,
+        ssh_public_key: Optional[str] = None,
+    ) -> LaunchResult:
         self._check_key()
-        self.create_calls.append({"owned_name": owned_name, "mode": spec.mode, "gpu_type": spec.gpu_type})
+        self.create_calls.append({
+            "owned_name": owned_name,
+            "mode": spec.mode,
+            "gpu_type": spec.gpu_type,
+            "has_ssh_key": bool(ssh_public_key),
+        })
         if self.transient_failures_remaining > 0:
             self.transient_failures_remaining -= 1
             raise TransientAllocationError("no longer any instances available")
@@ -100,7 +119,23 @@ class FakeRunPodDriver(ProviderDriver):
             if len(self.poll_sequence) > 1:
                 return self.poll_sequence.pop(0)
             return self.poll_sequence[0]
-        return PollResult(state="completed", progress_token="done", output={"ok": True}, uptime_secs=10)
+        return PollResult(state="completed", progress_token="done", output={"ok": True}, uptime_secs=10, ssh_endpoint=("203.0.113.10", 22022))
+
+    def run_pod_command(
+        self,
+        ssh_endpoint: Tuple[str, int],
+        private_key_path: Path,
+        spec: JobSpec,
+        walltime_remaining_secs: float,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> ExecResult:
+        self._check_key()
+        self.exec_calls.append({
+            "ssh_endpoint": ssh_endpoint,
+            "key_exists": private_key_path.exists(),
+            "command": spec.command,
+        })
+        return self.exec_result
 
     def terminate(self, resource_id: str, spec: JobSpec) -> None:
         self._check_key()

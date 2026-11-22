@@ -1,22 +1,23 @@
-"""Columbus controller: budget ledger, approval-gated execution, teardown, quarantine, and reaper."""
+"""Columbus controller: budget ledger, approval-gated execution, ephemeral SSH, teardown, quarantine, and reaper."""
 
 from __future__ import annotations
 
 import json
 import os
 import secrets
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from columbus.approval import ApprovalError, ApprovalStore, DEFAULT_APPROVAL_TTL_SECS, canonical_spec_hash
 from columbus.artifacts import ArtifactError, write_artifacts
 from columbus.drivers.base import (
-    CostEstimate,
     DriverError,
     JobSpec,
-    OwnedResource,
     ProviderDriver,
     TransientAllocationError,
 )
@@ -47,12 +48,35 @@ class LaneConfig:
     min_balance_floor_usd: float = DEFAULT_MIN_BALANCE_FLOOR_USD
     max_usd_per_job: float = 2.00
     max_walltime_secs: int = 3600
+    default_startup_timeout_secs: int = 420
     default_idle_timeout_secs: int = 600
     default_approval_ttl_secs: int = DEFAULT_APPROVAL_TTL_SECS
     approval_poll_secs: float = 2.0
     job_poll_secs: float = 5.0
     alloc_retry_delay_secs: float = 30.0
     max_seats: int = 1
+
+
+def _generate_ephemeral_ssh_keypair(parent_dir: Path) -> Tuple[Path, Path, str]:
+    """Generate a single-use ed25519 keypair in a 0700 temp directory."""
+    make_private_dir(parent_dir)
+    key_dir = Path(tempfile.mkdtemp(prefix="ssh-", dir=str(parent_dir)))
+    os.chmod(key_dir, 0o700)
+    priv_path = key_dir / "id_ed25519"
+    pub_path = key_dir / "id_ed25519.pub"
+    res = subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "columbus-ephemeral", "-f", str(priv_path), "-q"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if res.returncode != 0 or not priv_path.exists() or not pub_path.exists():
+        shutil.rmtree(key_dir, ignore_errors=True)
+        raise Refusal("ephemeral_ssh_keygen_failed")
+    os.chmod(priv_path, 0o600)
+    os.chmod(pub_path, 0o600)
+    return key_dir, priv_path, pub_path.read_text(encoding="utf-8").strip()
 
 
 class BudgetLedger:
@@ -97,9 +121,9 @@ class BudgetLedger:
         if estimated_max_usd < 0:
             raise Refusal("invalid_cost_estimate")
         if snap["spent_usd"] + estimated_max_usd > snap["budget_cap_usd"] + 1e-9:
-            raise Refusal(
-                f"budget_cap_exceeded:spent={snap["spent_usd"]:.4f}+est={estimated_max_usd:.4f}>cap={snap["budget_cap_usd"]:.4f}"
-            )
+            s_val = snap["spent_usd"]
+            c_val = snap["budget_cap_usd"]
+            raise Refusal(f"budget_cap_exceeded:spent={s_val:.4f}+est={estimated_max_usd:.4f}>cap={c_val:.4f}")
         return snap
 
     def record_spend(self, job_tag: str, usd_spent: float, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -191,6 +215,8 @@ class ColumbusController:
         max_wall = int(request.get("max_walltime_secs", min(600, self.config.max_walltime_secs)))
         if max_wall < 30 or max_wall > self.config.max_walltime_secs:
             raise Refusal("max_walltime_out_of_bounds")
+        startup_secs = int(request.get("startup_timeout_secs", min(self.config.default_startup_timeout_secs, max_wall)))
+        startup_secs = max(30, min(startup_secs, max_wall))
         idle_secs = int(request.get("idle_timeout_secs", min(self.config.default_idle_timeout_secs, max_wall)))
         idle_secs = max(10, min(idle_secs, max_wall))
         gpu_count = int(request.get("gpu_count", 1))
@@ -200,6 +226,10 @@ class ColumbusController:
         if not isinstance(raw_env, dict):
             raise Refusal("invalid_env")
         env = {str(k): str(v) for k, v in raw_env.items()}
+        raw_files = request.get("files_out") or []
+        if not isinstance(raw_files, list) or len(raw_files) > 2:
+            raise Refusal("invalid_files_out")
+        files_out = tuple(str(x) for x in raw_files)
         payload = request.get("payload") or {}
         if not isinstance(payload, dict):
             raise Refusal("invalid_payload")
@@ -210,15 +240,18 @@ class ColumbusController:
             gpu_count=gpu_count,
             cloud_type=str(request.get("cloud_type") or "COMMUNITY").upper(),
             image=str(request.get("image") or "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04"),
+            command=str(request.get("command") or ""),
             docker_args=str(request.get("docker_args") or ""),
             container_disk_gb=int(request.get("container_disk_gb", 20)),
             volume_gb=int(request.get("volume_gb", 0)),
             network_volume_id=str(request["network_volume_id"]) if request.get("network_volume_id") else None,
             env=env,
+            files_out=files_out,
             endpoint_id=str(request.get("endpoint_id") or ""),
             payload=payload,
             max_usd=max_usd,
             max_walltime_secs=max_wall,
+            startup_timeout_secs=startup_secs,
             idle_timeout_secs=idle_secs,
             requesting_agent=str(request.get("requesting_agent") or "agent"),
         )
@@ -285,15 +318,16 @@ class ColumbusController:
             requesting_agent=spec.requesting_agent,
             approval_ttl_secs=ttl,
         )
+        tid = ticket["ticket_id"]
         return {
             "ok": True,
             "status": "pending_approval",
             "lane_id": self.config.lane_id,
-            "ticket_id": ticket["ticket_id"],
+            "ticket_id": tid,
             "spec_sha256": ticket["spec_sha256"],
             "estimate": est.to_dict(),
             "expires_at": ticket["expires_at"],
-            "approval_command": f"columbus_ctl.py approve {ticket["ticket_id"]}",
+            "approval_command": f"columbus_ctl.py approve {tid}",
         }
 
     def _verify_zero_owned(self, owned_name: str) -> bool:
@@ -321,7 +355,7 @@ class ColumbusController:
         request: Dict[str, Any],
         is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> Dict[str, Any]:
-        """Full approval-gated execution lifecycle with durable intent and guaranteed teardown."""
+        """Full approval-gated execution lifecycle with durable intent, ephemeral SSH, and guaranteed teardown."""
         self._require_accepting()
         spec = self.parse_spec(request)
         spec_dict = spec.to_canonical_dict()
@@ -334,7 +368,7 @@ class ColumbusController:
             raise Refusal(f"balance_below_floor:{balance_before:.4f}<{self.config.min_balance_floor_usd:.4f}")
         self.ledger.check_admission(est.estimated_max_usd)
 
-        # Mandatory human owner approval gate (before acquiring seat or touching provider create)
+        # Mandatory human owner approval gate
         ticket_id = request.get("ticket_id")
         if ticket_id:
             approval_ticket = self.approvals.verify_and_consume(str(ticket_id), spec_dict)
@@ -375,11 +409,17 @@ class ColumbusController:
             if intent_path.exists():
                 raise Refusal("unresolved_prior_intent_run_reap")
 
-            # Re-verify balance and budget under seat lock right before create
             balance_before = self.driver.get_balance()
             if balance_before < self.config.min_balance_floor_usd:
                 raise Refusal(f"balance_below_floor:{balance_before:.4f}")
             self.ledger.check_admission(est.estimated_max_usd)
+
+            use_ssh = spec.mode == "pod" and bool(spec.command)
+            ssh_key_dir: Optional[Path] = None
+            ssh_priv_path: Optional[Path] = None
+            ssh_pub_key: Optional[str] = None
+            if use_ssh:
+                ssh_key_dir, ssh_priv_path, ssh_pub_key = _generate_ephemeral_ssh_keypair(self.lane_dir)
 
             job_nonce = secrets.token_hex(4)
             owned_name = f"{OWNED_PREFIX}{self.config.lane_id}-{job_nonce}-g1"
@@ -398,89 +438,143 @@ class ColumbusController:
 
             launch = None
             attempts = 0
-            while True:
-                attempts += 1
-                try:
-                    launch = self.driver.create(spec, owned_name)
-                    break
-                except TransientAllocationError:
-                    if attempts >= 2:
-                        if intent_path.exists():
-                            intent_path.unlink()
-                        return {
-                            "ok": False,
-                            "lane_id": self.config.lane_id,
-                            "error": "allocation_failed",
-                            "attempts": attempts,
-                            "cleanup_verified": True,
-                        }
-                    # 1x backoff retry ONLY when $0 spent and 0 owned pods created
-                    self.sleeper(self.config.alloc_retry_delay_secs)
-                    recheck_bal = self.driver.get_balance()
-                    owned_now = [r for r in self.driver.list_owned(OWNED_PREFIX) if r.name == owned_name]
-                    if abs(recheck_bal - balance_before) > 1e-6 or owned_now or recheck_bal < self.config.min_balance_floor_usd:
-                        if owned_now:
-                            for r in owned_now:
-                                self._cleanup_owned(r.resource_id, owned_name, spec)
-                        if intent_path.exists() and not self.quarantine_path.exists():
-                            intent_path.unlink()
-                        return {
-                            "ok": False,
-                            "lane_id": self.config.lane_id,
-                            "error": "allocation_retry_aborted",
-                            "attempts": attempts,
-                        }
-                    owned_name = f"{OWNED_PREFIX}{self.config.lane_id}-{job_nonce}-g2"
-                    intent["owned_name"] = owned_name
-                    atomic_write_json(intent_path, intent)
-                except Exception:
-                    if intent_path.exists():
-                        intent_path.unlink()
-                    raise
-
-            intent["resource_id"] = launch.resource_id
-            atomic_write_json(intent_path, intent)
-
-            started_at = self.clock()
-            last_progress_at = started_at
-            last_progress_marker = ""
-            final_state = "running"
-            final_output: Any = None
-            final_error = ""
-            cleanup_verified = False
-
             try:
                 while True:
-                    now = self.clock()
-                    if is_cancelled and is_cancelled():
-                        final_state = "cancelled"
-                        final_error = "cancelled_by_caller"
+                    attempts += 1
+                    try:
+                        launch = self.driver.create(spec, owned_name, ssh_public_key=ssh_pub_key)
                         break
-                    if (now - started_at) >= spec.max_walltime_secs:
-                        final_state = "timed_out"
-                        final_error = "walltime_exceeded"
-                        break
-                    poll_res = self.driver.poll(launch.resource_id, spec)
-                    if poll_res.progress_token and poll_res.progress_token != last_progress_marker:
-                        last_progress_marker = poll_res.progress_token
-                        last_progress_at = now
-                    if poll_res.state in ("completed", "failed", "cancelled", "timed_out"):
-                        final_state = poll_res.state
-                        final_output = poll_res.output
-                        final_error = poll_res.error
-                        break
-                    if (now - last_progress_at) >= spec.idle_timeout_secs:
-                        final_state = "idle_timeout"
-                        final_error = "idle_timeout"
-                        break
-                    self.sleeper(self.config.job_poll_secs)
+                    except TransientAllocationError:
+                        if attempts >= 2:
+                            if intent_path.exists():
+                                intent_path.unlink()
+                            return {
+                                "ok": False,
+                                "lane_id": self.config.lane_id,
+                                "error": "allocation_failed",
+                                "attempts": attempts,
+                                "cleanup_verified": True,
+                            }
+                        self.sleeper(self.config.alloc_retry_delay_secs)
+                        recheck_bal = self.driver.get_balance()
+                        owned_now = [r for r in self.driver.list_owned(OWNED_PREFIX) if r.name == owned_name]
+                        if abs(recheck_bal - balance_before) > 1e-6 or owned_now or recheck_bal < self.config.min_balance_floor_usd:
+                            if owned_now:
+                                for r in owned_now:
+                                    self._cleanup_owned(r.resource_id, owned_name, spec)
+                            if intent_path.exists() and not self.quarantine_path.exists():
+                                intent_path.unlink()
+                            return {
+                                "ok": False,
+                                "lane_id": self.config.lane_id,
+                                "error": "allocation_retry_aborted",
+                                "attempts": attempts,
+                            }
+                        owned_name = f"{OWNED_PREFIX}{self.config.lane_id}-{job_nonce}-g2"
+                        intent["owned_name"] = owned_name
+                        atomic_write_json(intent_path, intent)
+                    except Exception:
+                        if intent_path.exists():
+                            intent_path.unlink()
+                        raise
+
+                intent["resource_id"] = launch.resource_id
+                atomic_write_json(intent_path, intent)
+
+                started_at = self.clock()
+                last_progress_at = started_at
+                last_progress_marker = ""
+                final_state = "running"
+                final_output: Any = None
+                final_error = ""
+                exit_code: Optional[int] = None
+                stdout_preview = ""
+                artifact_files: Dict[str, bytes] = {}
+                cleanup_verified = False
+
+                try:
+                    if use_ssh:
+                        assert ssh_priv_path is not None
+                        ssh_ep: Optional[Tuple[str, int]] = None
+                        while True:
+                            now = self.clock()
+                            if is_cancelled and is_cancelled():
+                                final_state = "cancelled"
+                                final_error = "cancelled_during_startup"
+                                break
+                            if (now - started_at) >= spec.startup_timeout_secs:
+                                final_state = "timed_out"
+                                final_error = "pod_startup_timeout"
+                                break
+                            if (now - started_at) >= spec.max_walltime_secs:
+                                final_state = "timed_out"
+                                final_error = "walltime_exceeded"
+                                break
+                            poll_res = self.driver.poll(launch.resource_id, spec)
+                            if poll_res.ssh_endpoint:
+                                ssh_ep = poll_res.ssh_endpoint
+                                break
+                            if poll_res.state in ("failed", "cancelled", "timed_out"):
+                                final_state = poll_res.state
+                                final_error = poll_res.error or "pod_failed_during_startup"
+                                break
+                            self.sleeper(self.config.job_poll_secs)
+
+                        if ssh_ep is not None:
+                            remaining = max(10.0, spec.max_walltime_secs - (self.clock() - started_at))
+                            exec_res = self.driver.run_pod_command(
+                                ssh_endpoint=ssh_ep,
+                                private_key_path=ssh_priv_path,
+                                spec=spec,
+                                walltime_remaining_secs=remaining,
+                                is_cancelled=is_cancelled,
+                            )
+                            final_state = exec_res.state
+                            exit_code = exec_res.exit_code
+                            final_error = exec_res.error
+                            stdout_preview = exec_res.stdout[:800]
+                            if exec_res.stdout:
+                                artifact_files["stdout.log"] = exec_res.stdout.encode("utf-8")
+                            if exec_res.stderr:
+                                artifact_files["stderr.log"] = exec_res.stderr.encode("utf-8")
+                            for fname, fbytes in exec_res.files_out_bytes.items():
+                                if len(artifact_files) < 4:
+                                    artifact_files[fname] = fbytes
+                    else:
+                        while True:
+                            now = self.clock()
+                            if is_cancelled and is_cancelled():
+                                final_state = "cancelled"
+                                final_error = "cancelled_by_caller"
+                                break
+                            if (now - started_at) >= spec.max_walltime_secs:
+                                final_state = "timed_out"
+                                final_error = "walltime_exceeded"
+                                break
+                            poll_res = self.driver.poll(launch.resource_id, spec)
+                            if poll_res.progress_token and poll_res.progress_token != last_progress_marker:
+                                last_progress_marker = poll_res.progress_token
+                                last_progress_at = now
+                            if poll_res.state in ("completed", "failed", "cancelled", "timed_out"):
+                                final_state = poll_res.state
+                                final_output = poll_res.output
+                                final_error = poll_res.error
+                                break
+                            if (now - last_progress_at) >= spec.idle_timeout_secs:
+                                final_state = "idle_timeout"
+                                final_error = "idle_timeout"
+                                break
+                            self.sleeper(self.config.job_poll_secs)
+                finally:
+                    if spec.mode == "pod" or final_state not in ("completed", "failed", "cancelled", "timed_out"):
+                        cleanup_verified = self._cleanup_owned(launch.resource_id, owned_name, spec)
+                    else:
+                        cleanup_verified = True
+                    if cleanup_verified and intent_path.exists():
+                        intent_path.unlink()
             finally:
-                if spec.mode == "pod" or final_state not in ("completed", "failed", "cancelled", "timed_out"):
-                    cleanup_verified = self._cleanup_owned(launch.resource_id, owned_name, spec)
-                else:
-                    cleanup_verified = True
-                if cleanup_verified and intent_path.exists():
-                    intent_path.unlink()
+                if ssh_key_dir and ssh_key_dir.exists():
+                    shutil.rmtree(ssh_key_dir, ignore_errors=True)
 
             elapsed_secs = max(0.0, self.clock() - started_at)
             balance_after = balance_before
@@ -497,13 +591,12 @@ class ColumbusController:
                 meta={"mode": spec.mode, "resource_id": launch.resource_id, "state": final_state},
             )
 
+            if final_output is not None and "output.json" not in artifact_files and len(artifact_files) < 4:
+                artifact_files["output.json"] = json.dumps(final_output, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
+
             artifact_receipts: List[Dict[str, Any]] = []
-            if final_output is not None:
-                raw_out = json.dumps(final_output, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
-                artifact_receipts = write_artifacts(
-                    self.artifacts_dir / owned_name,
-                    {"output.json": raw_out},
-                )
+            if artifact_files:
+                artifact_receipts = write_artifacts(self.artifacts_dir / owned_name, artifact_files)
 
             return {
                 "ok": final_state == "completed" and cleanup_verified,
@@ -514,6 +607,8 @@ class ColumbusController:
                 "owned_name": owned_name,
                 "resource_id": launch.resource_id,
                 "state": final_state,
+                "exit_code": exit_code,
+                "stdout_preview": stdout_preview or None,
                 "error": final_error or None,
                 "attempts": attempts,
                 "elapsed_secs": round(elapsed_secs, 2),

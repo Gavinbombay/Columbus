@@ -1,17 +1,25 @@
-"""RunPod provider driver (Pods via GraphQL + Serverless via REST v2) using stdlib only."""
+"""RunPod provider driver (Pods via GraphQL + ephemeral SSH + Serverless via REST v2) using stdlib only."""
 
 from __future__ import annotations
 
+import base64
 import json
 import os
+import select
+import shlex
+import signal
+import subprocess
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from columbus.artifacts import MAX_FILE_BYTES, validate_artifact_name
 from columbus.drivers.base import (
     CostEstimate,
     DriverError,
+    ExecResult,
     JobSpec,
     LaunchResult,
     OwnedResource,
@@ -25,6 +33,7 @@ DEFAULT_GRAPHQL_URL = "https://api.runpod.io/graphql"
 DEFAULT_SERVERLESS_BASE_URL = "https://api.runpod.ai/v2"
 DEFAULT_KEY_FILE = Path.home() / ".config" / "columbus" / "runpod_api_key"
 DEFAULT_SERVERLESS_CONSERVATIVE_HOURLY_USD = 2.50
+MAX_CAPTURED_LOG_BYTES = 2 * 1024 * 1024  # 2 MiB per stream
 
 TRANSIENT_ALLOC_MARKERS = (
     "no longer any instances available",
@@ -150,13 +159,14 @@ class RunPodDriver(ProviderDriver):
                 raise DriverError(f"runpod_gpu_price_unavailable:{spec.gpu_type}")
             hourly_f = float(hourly) * max(1, int(spec.gpu_count))
             est_max = round(hourly_f * (float(spec.max_walltime_secs) / 3600.0), 4)
+            disp = matched.get("displayName") or spec.gpu_type
             return CostEstimate(
                 provider=self.name,
                 mode="pod",
                 hourly_rate_usd=round(hourly_f, 4),
                 estimated_max_usd=est_max,
                 resolved_target=str(matched.get("id", spec.gpu_type)),
-                notes=f"{spec.cloud_type.upper()} {spec.gpu_count}x {matched.get("displayName", spec.gpu_type)}",
+                notes=f"{spec.cloud_type.upper()} {spec.gpu_count}x {disp}",
             )
 
         if spec.mode == "serverless":
@@ -171,13 +181,14 @@ class RunPodDriver(ProviderDriver):
                 raise DriverError(f"runpod_unknown_endpoint:{spec.endpoint_id}")
             hourly_f = DEFAULT_SERVERLESS_CONSERVATIVE_HOURLY_USD
             est_max = round(min(spec.max_usd, hourly_f * (float(spec.max_walltime_secs) / 3600.0)), 4)
+            ep_name = matched.get("name") or spec.endpoint_id
             return CostEstimate(
                 provider=self.name,
                 mode="serverless",
                 hourly_rate_usd=hourly_f,
                 estimated_max_usd=est_max,
                 resolved_target=str(matched.get("id")),
-                notes=f"serverless endpoint {matched.get("name", spec.endpoint_id)}",
+                notes=f"serverless endpoint {ep_name}",
             )
 
         raise DriverError(f"unsupported_mode:{spec.mode}")
@@ -214,12 +225,19 @@ class RunPodDriver(ProviderDriver):
             )
         return owned
 
-    def create(self, spec: JobSpec, owned_name: str) -> LaunchResult:
+    def create(
+        self,
+        spec: JobSpec,
+        owned_name: str,
+        ssh_public_key: Optional[str] = None,
+    ) -> LaunchResult:
         if not owned_name.startswith("diffuser-columbus-"):
             raise DriverError("invalid_owned_name")
         if spec.mode == "pod":
             env_map = {"HF_HUB_DISABLE_XET": "1", "COLUMBUS_JOB_TAG": owned_name}
             env_map.update(spec.env)
+            if ssh_public_key:
+                env_map["PUBLIC_KEY"] = ssh_public_key.strip()
             env_list = [{"key": str(k), "value": str(v)} for k, v in sorted(env_map.items())]
             pod_input: Dict[str, Any] = {
                 "cloudType": spec.cloud_type.upper(),
@@ -230,6 +248,8 @@ class RunPodDriver(ProviderDriver):
                 "name": owned_name,
                 "imageName": spec.image,
                 "env": env_list,
+                "startSsh": bool(ssh_public_key),
+                "ports": "22/tcp",
             }
             if spec.docker_args:
                 pod_input["dockerArgs"] = spec.docker_args
@@ -285,6 +305,7 @@ class RunPodDriver(ProviderDriver):
                 lastStatusChange
                 runtime {
                   uptimeInSeconds
+                  ports { ip isIpPublic privatePort publicPort type }
                   gpus { id gpuUtilPercent memoryUtilPercent }
                 }
               }
@@ -300,23 +321,36 @@ class RunPodDriver(ProviderDriver):
             last_change = str(pod.get("lastStatusChange") or "")
             runtime = pod.get("runtime") if isinstance(pod.get("runtime"), dict) else {}
             uptime = int(runtime.get("uptimeInSeconds") or 0)
+
+            ssh_ep: Optional[Tuple[str, int]] = None
+            ports = runtime.get("ports") if isinstance(runtime.get("ports"), list) else []
+            for p in ports:
+                if not isinstance(p, dict):
+                    continue
+                if int(p.get("privatePort") or 0) == 22 and p.get("isIpPublic") and p.get("ip") and p.get("publicPort"):
+                    ssh_ep = (str(p["ip"]), int(p["publicPort"]))
+                    break
+
             if desired in ("EXITED", "TERMINATED", "STOPPED"):
                 return PollResult(
                     state="completed",
                     progress_token=f"{desired}:{uptime}:{last_change}",
                     output={"desiredStatus": desired, "uptimeInSeconds": uptime, "lastStatusChange": last_change},
                     uptime_secs=uptime,
+                    ssh_endpoint=ssh_ep,
                 )
-            if runtime and uptime > 0:
+            if runtime and (uptime > 0 or ssh_ep is not None):
                 return PollResult(
                     state="running",
-                    progress_token=f"running:{uptime}:{last_change}",
+                    progress_token=f"running:{uptime}:{last_change}:{ssh_ep}",
                     uptime_secs=uptime,
+                    ssh_endpoint=ssh_ep,
                 )
             return PollResult(
                 state="pending",
                 progress_token=f"pending:{desired}:{last_change}",
                 uptime_secs=uptime,
+                ssh_endpoint=ssh_ep,
             )
 
         if spec.mode == "serverless":
@@ -339,6 +373,149 @@ class RunPodDriver(ProviderDriver):
             raise DriverError(f"runpod_serverless_unknown_status:{status}")
 
         raise DriverError(f"unsupported_mode:{spec.mode}")
+
+    def _ssh_base_cmd(self, ssh_endpoint: Tuple[str, int], private_key_path: Path) -> List[str]:
+        host, port = ssh_endpoint
+        return [
+            "ssh",
+            "-i", str(private_key_path),
+            "-p", str(port),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "IdentitiesOnly=yes",
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            f"root@{host}",
+        ]
+
+    def _wait_for_sshd(
+        self,
+        ssh_endpoint: Tuple[str, int],
+        private_key_path: Path,
+        deadline: float,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> bool:
+        probe_cmd = self._ssh_base_cmd(ssh_endpoint, private_key_path) + ["true"]
+        while time.time() < deadline:
+            if is_cancelled and is_cancelled():
+                return False
+            res = subprocess.run(probe_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            if res.returncode == 0:
+                return True
+            time.sleep(3)
+        return False
+
+    def run_pod_command(
+        self,
+        ssh_endpoint: Tuple[str, int],
+        private_key_path: Path,
+        spec: JobSpec,
+        walltime_remaining_secs: float,
+        is_cancelled: Optional[Callable[[], bool]] = None,
+    ) -> ExecResult:
+        start = time.time()
+        hard_deadline = start + max(10.0, walltime_remaining_secs)
+        sshd_deadline = min(hard_deadline, start + 60.0)
+        if not self._wait_for_sshd(ssh_endpoint, private_key_path, sshd_deadline, is_cancelled=is_cancelled):
+            if is_cancelled and is_cancelled():
+                return ExecResult(state="cancelled", error="cancelled_during_sshd_wait")
+            return ExecResult(state="failed", error="sshd_connect_timeout")
+
+        script_b64 = base64.b64encode(spec.command.encode("utf-8")).decode("ascii")
+        remote_cmd = f"echo {script_b64} | base64 -d > /tmp/columbus_run.sh && chmod +x /tmp/columbus_run.sh && bash /tmp/columbus_run.sh"
+        full_cmd = self._ssh_base_cmd(ssh_endpoint, private_key_path) + [remote_cmd]
+
+        proc = subprocess.Popen(
+            full_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert proc.stdout is not None and proc.stderr is not None
+        os.set_blocking(proc.stdout.fileno(), False)
+        os.set_blocking(proc.stderr.fileno(), False)
+
+        stdout_buf = bytearray()
+        stderr_buf = bytearray()
+        last_activity = time.time()
+        open_fds = {proc.stdout.fileno(): ("stdout", proc.stdout), proc.stderr.fileno(): ("stderr", proc.stderr)}
+        abort_state = ""
+
+        try:
+            while open_fds:
+                now = time.time()
+                if is_cancelled and is_cancelled():
+                    abort_state = "cancelled"
+                    break
+                if now >= hard_deadline:
+                    abort_state = "timed_out"
+                    break
+                if (now - last_activity) >= spec.idle_timeout_secs:
+                    abort_state = "idle_timeout"
+                    break
+
+                ready, _, _ = select.select(list(open_fds.keys()), [], [], 1.0)
+                for fd in ready:
+                    name, stream = open_fds[fd]
+                    chunk = stream.read(65536)
+                    if not chunk:
+                        open_fds.pop(fd, None)
+                        continue
+                    last_activity = time.time()
+                    buf = stdout_buf if name == "stdout" else stderr_buf
+                    if len(buf) < MAX_CAPTURED_LOG_BYTES:
+                        buf.extend(chunk[: MAX_CAPTURED_LOG_BYTES - len(buf)])
+
+            if abort_state:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    proc.wait(timeout=5)
+                return ExecResult(
+                    state=abort_state,
+                    exit_code=proc.returncode,
+                    stdout=stdout_buf.decode("utf-8", errors="replace"),
+                    stderr=stderr_buf.decode("utf-8", errors="replace"),
+                    error=abort_state,
+                )
+
+            rc = proc.wait(timeout=15)
+        finally:
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait(timeout=5)
+
+        files_out_bytes: Dict[str, bytes] = {}
+        if rc == 0 and spec.files_out:
+            for remote_path in spec.files_out:
+                base_name = validate_artifact_name(Path(remote_path).name)
+                cat_cmd = self._ssh_base_cmd(ssh_endpoint, private_key_path) + [f"cat -- {shlex.quote(remote_path)}"]
+                fres = subprocess.run(cat_cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
+                if fres.returncode == 0 and len(fres.stdout) <= MAX_FILE_BYTES:
+                    files_out_bytes[base_name] = fres.stdout
+
+        return ExecResult(
+            state="completed" if rc == 0 else "failed",
+            exit_code=rc,
+            stdout=stdout_buf.decode("utf-8", errors="replace"),
+            stderr=stderr_buf.decode("utf-8", errors="replace"),
+            error="" if rc == 0 else f"exit_code_{rc}",
+            files_out_bytes=files_out_bytes,
+        )
 
     def terminate(self, resource_id: str, spec: JobSpec) -> None:
         if spec.mode == "pod":
