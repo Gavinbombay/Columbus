@@ -90,7 +90,10 @@ class RunPodDriver(ProviderDriver):
         except urllib.error.HTTPError as exc:
             err_body = ""
             try:
-                err_body = exc.read().decode("utf-8", errors="replace")[:300]
+                # HTTPError bodies are controlled by the remote endpoint. Bound
+                # the read itself; slicing afterward would still buffer an
+                # arbitrarily large error response in memory.
+                err_body = exc.read(301).decode("utf-8", errors="replace")[:300]
             except Exception:
                 pass
             safe = redact_secrets(err_body, (key,))

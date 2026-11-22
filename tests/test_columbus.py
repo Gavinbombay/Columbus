@@ -6,11 +6,14 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 from pathlib import Path
 
 from columbus.controller import ColumbusController, LaneConfig
-from columbus.drivers.base import OwnedResource, PollResult
+from columbus.drivers.base import DriverError, OwnedResource, PollResult
 from columbus.drivers.fake import FakeRunPodDriver
+from columbus.drivers.runpod import RunPodDriver
 from columbus.secure_io import atomic_write_json
 
 
@@ -342,3 +345,25 @@ class ColumbusAuditHardeningTests(unittest.TestCase):
         res = ctrl.handle({"action": "status"})
         self.assertFalse(res["ok"])
         self.assertEqual(res["error"], "api_key_open_failed")
+
+    def test_http_error_body_read_is_bounded(self) -> None:
+        class CountingBody:
+            def close(self) -> None:
+                pass
+
+            def __init__(self) -> None:
+                self.requested = []
+
+            def read(self, size: int = -1) -> bytes:
+                self.requested.append(size)
+                return b"x" * (size if size >= 0 else 1024 * 1024)
+
+        body = CountingBody()
+        err = HTTPError("https://api.runpod.io/graphql", 500, "failure", {}, body)
+        driver = RunPodDriver(key_file=self.key_file)
+
+        with patch("columbus.drivers.runpod.urllib.request.urlopen", side_effect=err):
+            with self.assertRaisesRegex(DriverError, "runpod_http_500"):
+                driver._http_json("https://api.runpod.io/graphql")
+
+        self.assertEqual(body.requested, [301])
