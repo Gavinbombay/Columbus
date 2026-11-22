@@ -124,7 +124,7 @@ class FakeRunPodDriver(ProviderDriver):
     def run_pod_command(
         self,
         ssh_endpoint: Tuple[str, int],
-        private_key_path: Path,
+        identity_path: Path,
         spec: JobSpec,
         walltime_remaining_secs: float,
         is_cancelled: Optional[Callable[[], bool]] = None,
@@ -132,7 +132,7 @@ class FakeRunPodDriver(ProviderDriver):
         self._check_key()
         self.exec_calls.append({
             "ssh_endpoint": ssh_endpoint,
-            "key_exists": private_key_path.exists(),
+            "key_exists": identity_path.exists(),
             "command": spec.command,
         })
         return self.exec_result

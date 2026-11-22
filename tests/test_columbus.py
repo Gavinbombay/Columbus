@@ -290,3 +290,55 @@ class ColumbusEphemeralSshTests(unittest.TestCase):
         # Verify temp ssh-* dir was cleaned up
         ssh_dirs = list((self.root / "state" / "columbus-runpod").glob("ssh-*"))
         self.assertEqual(ssh_dirs, [])
+
+
+class ColumbusAuditHardeningTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.key_file = self.root / "runpod_api_key"
+        self.key_file.write_text("fake_key_hardened_000\n", encoding="utf-8")
+        os.chmod(self.key_file, 0o600)
+        self.clock = FakeClock()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_nv1_atomic_budget_reservation_blocks_overcommit(self) -> None:
+        drv = FakeRunPodDriver(balance_usd=6.88, key_file=self.key_file)
+        cfg = LaneConfig(lane_id="lane-a", state_root=self.root / "state", budget_cap_usd=1.00)
+        ctrl = ColumbusController(cfg, drv, clock=self.clock, sleeper=self.clock.sleep)
+        ctrl.ledger.reserve("lane-b-inflight", 0.90)
+        res = ctrl.handle({"action": "stage", "mode": "pod", "max_usd": 0.50, "max_walltime_secs": 1800})
+        self.assertFalse(res["ok"])
+        self.assertIn("budget_cap_exceeded", res["error"])
+        ctrl.ledger.release("lane-b-inflight")
+        ok = ctrl.handle({"action": "stage", "mode": "pod", "max_usd": 0.50, "max_walltime_secs": 1800})
+        self.assertTrue(ok["ok"], ok)
+
+    def test_nv3_reaper_never_terminates_unverified_intent_id(self) -> None:
+        foreign = OwnedResource(resource_id="foreign-victim-1", name="user-personal-pod", status="RUNNING")
+        drv = FakeRunPodDriver(balance_usd=6.88, foreign_pods=[foreign], key_file=self.key_file)
+        cfg = LaneConfig(lane_id="columbus-runpod", state_root=self.root / "state", budget_cap_usd=6.88)
+        ctrl = ColumbusController(cfg, drv, clock=self.clock, sleeper=self.clock.sleep)
+        atomic_write_json(ctrl.lane_dir / "seat-0.intent.json", {
+            "pid": 99999999,
+            "lane_id": "columbus-runpod",
+            "owned_name": "diffuser-columbus-columbus-runpod-fake-g1",
+            "mode": "pod",
+            "resource_id": "foreign-victim-1",
+        })
+        res = ctrl.reap(dry_run=False)
+        self.assertTrue(res["ok"])
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertIn("foreign-victim-1", drv.pods)
+
+    def test_nv4_symlink_api_key_rejected(self) -> None:
+        sym = self.root / "symlink_key"
+        os.symlink(self.key_file, sym)
+        drv = FakeRunPodDriver(balance_usd=6.88, key_file=sym)
+        cfg = LaneConfig(lane_id="columbus-runpod", state_root=self.root / "state")
+        ctrl = ColumbusController(cfg, drv, clock=self.clock, sleeper=self.clock.sleep)
+        res = ctrl.handle({"action": "status"})
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "api_key_open_failed")

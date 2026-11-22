@@ -49,8 +49,9 @@ def atomic_write_json(path: Path, payload: Any, mode: int = 0o600) -> None:
 
 
 def read_json(path: Path, max_bytes: int = MAX_JSON_BYTES) -> Any:
-    """Read and parse bounded JSON from a file."""
-    data = path.read_bytes()
+    """Read and parse bounded JSON from a file without buffering unbounded data."""
+    with path.open("rb") as fh:
+        data = fh.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise SecureIOError("json_size_limit")
     return json.loads(data.decode("utf-8"))
@@ -86,15 +87,28 @@ def file_lock(lock_path: Path, blocking: bool = False) -> Iterator[int]:
 
 
 def load_api_key(key_file: Path) -> str:
-    """Dynamically load a provider API key from a 0600 file on each call."""
-    if not key_file.exists():
-        raise SecureIOError("api_key_missing")
-    st = os.stat(key_file)
-    if not stat.S_ISREG(st.st_mode):
-        raise SecureIOError("api_key_not_regular_file")
-    if st.st_mode & 0o077:
-        raise SecureIOError("api_key_insecure_permissions")
-    raw = key_file.read_text(encoding="utf-8").strip()
+    """Dynamically load a provider API key from a 0600 non-symlink file using fstat on the open FD."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(str(key_file), flags)
+    except FileNotFoundError as exc:
+        raise SecureIOError("api_key_missing") from exc
+    except OSError as exc:
+        raise SecureIOError("api_key_open_failed") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise SecureIOError("api_key_not_regular_file")
+        if st.st_mode & 0o077:
+            raise SecureIOError("api_key_insecure_permissions")
+        if st.st_size > 4096:
+            raise SecureIOError("api_key_size_limit")
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = -1
+            raw = fh.read(4097).strip()
+    finally:
+        if fd >= 0:
+            os.close(fd)
     if not raw:
         raise SecureIOError("api_key_empty")
     return raw

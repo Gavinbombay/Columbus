@@ -93,6 +93,7 @@ class BudgetLedger:
             return {
                 "budget_cap_usd": self.budget_cap_usd,
                 "spent_usd": 0.0,
+                "reservations": {},
                 "runs": [],
             }
         data = read_json(self.path)
@@ -100,8 +101,15 @@ class BudgetLedger:
             raise Refusal("budget_ledger_corrupt")
         data.setdefault("budget_cap_usd", self.budget_cap_usd)
         data.setdefault("spent_usd", 0.0)
+        data.setdefault("reservations", {})
         data.setdefault("runs", [])
         return data
+
+    def _reserved_total(self, data: Dict[str, Any]) -> float:
+        res = data.get("reservations") or {}
+        if not isinstance(res, dict):
+            return 0.0
+        return round(sum(max(0.0, float(v)) for v in res.values()), 6)
 
     def snapshot(self) -> Dict[str, Any]:
         make_private_dir(self.state_root)
@@ -109,10 +117,12 @@ class BudgetLedger:
             data = self._load_unlocked()
             cap = min(self.budget_cap_usd, float(data.get("budget_cap_usd", self.budget_cap_usd)))
             spent = round(float(data.get("spent_usd", 0.0)), 6)
+            reserved = self._reserved_total(data)
             return {
                 "budget_cap_usd": round(cap, 4),
                 "spent_usd": spent,
-                "remaining_usd": round(max(0.0, cap - spent), 6),
+                "reserved_usd": reserved,
+                "remaining_usd": round(max(0.0, cap - spent - reserved), 6),
                 "run_count": len(data.get("runs", [])),
             }
 
@@ -120,16 +130,59 @@ class BudgetLedger:
         snap = self.snapshot()
         if estimated_max_usd < 0:
             raise Refusal("invalid_cost_estimate")
-        if snap["spent_usd"] + estimated_max_usd > snap["budget_cap_usd"] + 1e-9:
-            s_val = snap["spent_usd"]
+        committed = snap["spent_usd"] + snap["reserved_usd"]
+        if committed + estimated_max_usd > snap["budget_cap_usd"] + 1e-9:
             c_val = snap["budget_cap_usd"]
-            raise Refusal(f"budget_cap_exceeded:spent={s_val:.4f}+est={estimated_max_usd:.4f}>cap={c_val:.4f}")
+            raise Refusal(f"budget_cap_exceeded:committed={committed:.4f}+est={estimated_max_usd:.4f}>cap={c_val:.4f}")
         return snap
 
-    def record_spend(self, job_tag: str, usd_spent: float, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def reserve(self, reservation_id: str, estimated_max_usd: float) -> Dict[str, Any]:
+        if estimated_max_usd < 0:
+            raise Refusal("invalid_cost_estimate")
         make_private_dir(self.state_root)
         with file_lock(self.lock_path, blocking=True):
             data = self._load_unlocked()
+            cap = min(self.budget_cap_usd, float(data.get("budget_cap_usd", self.budget_cap_usd)))
+            spent = round(float(data.get("spent_usd", 0.0)), 6)
+            reserved = self._reserved_total(data)
+            if spent + reserved + estimated_max_usd > cap + 1e-9:
+                raise Refusal(f"budget_cap_exceeded:committed={spent+reserved:.4f}+est={estimated_max_usd:.4f}>cap={cap:.4f}")
+            res_map = dict(data.get("reservations") or {})
+            res_map[reservation_id] = round(float(estimated_max_usd), 6)
+            data["reservations"] = res_map
+            atomic_write_json(self.path, data)
+            new_res = self._reserved_total(data)
+            return {
+                "budget_cap_usd": round(cap, 4),
+                "spent_usd": spent,
+                "reserved_usd": new_res,
+                "remaining_usd": round(max(0.0, cap - spent - new_res), 6),
+            }
+
+    def release(self, reservation_id: str) -> None:
+        make_private_dir(self.state_root)
+        with file_lock(self.lock_path, blocking=True):
+            data = self._load_unlocked()
+            res_map = dict(data.get("reservations") or {})
+            if reservation_id in res_map:
+                res_map.pop(reservation_id, None)
+                data["reservations"] = res_map
+                atomic_write_json(self.path, data)
+
+    def record_spend(
+        self,
+        job_tag: str,
+        usd_spent: float,
+        meta: Optional[Dict[str, Any]] = None,
+        reservation_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        make_private_dir(self.state_root)
+        with file_lock(self.lock_path, blocking=True):
+            data = self._load_unlocked()
+            res_map = dict(data.get("reservations") or {})
+            if reservation_id and reservation_id in res_map:
+                res_map.pop(reservation_id, None)
+            data["reservations"] = res_map
             delta = max(0.0, round(float(usd_spent), 6))
             data["spent_usd"] = round(float(data.get("spent_usd", 0.0)) + delta, 6)
             runs = list(data.get("runs", []))
@@ -142,10 +195,12 @@ class BudgetLedger:
             data["runs"] = runs[-200:]
             atomic_write_json(self.path, data)
             cap = min(self.budget_cap_usd, float(data.get("budget_cap_usd", self.budget_cap_usd)))
+            rem_res = self._reserved_total(data)
             return {
                 "budget_cap_usd": round(cap, 4),
                 "spent_usd": data["spent_usd"],
-                "remaining_usd": round(max(0.0, cap - data["spent_usd"]), 6),
+                "reserved_usd": rem_res,
+                "remaining_usd": round(max(0.0, cap - data["spent_usd"] - rem_res), 6),
             }
 
 
@@ -412,33 +467,34 @@ class ColumbusController:
             balance_before = self.driver.get_balance()
             if balance_before < self.config.min_balance_floor_usd:
                 raise Refusal(f"balance_below_floor:{balance_before:.4f}")
-            self.ledger.check_admission(est.estimated_max_usd)
+
+            job_nonce = secrets.token_hex(4)
+            reservation_id = f"{self.config.lane_id}-{job_nonce}"
+            self.ledger.reserve(reservation_id, est.estimated_max_usd)
 
             use_ssh = spec.mode == "pod" and bool(spec.command)
             ssh_key_dir: Optional[Path] = None
             ssh_priv_path: Optional[Path] = None
             ssh_pub_key: Optional[str] = None
-            if use_ssh:
-                ssh_key_dir, ssh_priv_path, ssh_pub_key = _generate_ephemeral_ssh_keypair(self.lane_dir)
-
-            job_nonce = secrets.token_hex(4)
             owned_name = f"{OWNED_PREFIX}{self.config.lane_id}-{job_nonce}-g1"
-            intent = {
-                "pid": os.getpid(),
-                "lane_id": self.config.lane_id,
-                "owned_name": owned_name,
-                "mode": spec.mode,
-                "endpoint_id": spec.endpoint_id,
-                "ticket_id": approval_ticket["ticket_id"],
-                "spec_sha256": approval_ticket["spec_sha256"],
-                "resource_id": None,
-                "created_at": self.clock(),
-            }
-            atomic_write_json(intent_path, intent)
-
             launch = None
             attempts = 0
+            spend_recorded = False
             try:
+                if use_ssh:
+                    ssh_key_dir, ssh_priv_path, ssh_pub_key = _generate_ephemeral_ssh_keypair(self.lane_dir)
+                intent = {
+                    "pid": os.getpid(),
+                    "lane_id": self.config.lane_id,
+                    "owned_name": owned_name,
+                    "mode": spec.mode,
+                    "endpoint_id": spec.endpoint_id,
+                    "ticket_id": approval_ticket["ticket_id"],
+                    "spec_sha256": approval_ticket["spec_sha256"],
+                    "resource_id": None,
+                    "created_at": self.clock(),
+                }
+                atomic_write_json(intent_path, intent)
                 while True:
                     attempts += 1
                     try:
@@ -524,7 +580,7 @@ class ColumbusController:
                             remaining = max(10.0, spec.max_walltime_secs - (self.clock() - started_at))
                             exec_res = self.driver.run_pod_command(
                                 ssh_endpoint=ssh_ep,
-                                private_key_path=ssh_priv_path,
+                                identity_path=ssh_priv_path,
                                 spec=spec,
                                 walltime_remaining_secs=remaining,
                                 is_cancelled=is_cancelled,
@@ -572,24 +628,27 @@ class ColumbusController:
                         cleanup_verified = True
                     if cleanup_verified and intent_path.exists():
                         intent_path.unlink()
+                elapsed_secs = max(0.0, self.clock() - started_at)
+                balance_after = balance_before
+                try:
+                    balance_after = self.driver.get_balance()
+                except Exception:
+                    pass
+                observed_delta = max(0.0, round(balance_before - balance_after, 6))
+                est_runtime_usd = round(est.hourly_rate_usd * (elapsed_secs / 3600.0), 6)
+                recorded_usd = observed_delta if observed_delta > 0 else min(est.estimated_max_usd, est_runtime_usd)
+                budget_after = self.ledger.record_spend(
+                    owned_name,
+                    recorded_usd,
+                    meta={"mode": spec.mode, "resource_id": launch.resource_id, "state": final_state},
+                    reservation_id=reservation_id,
+                )
+                spend_recorded = True
             finally:
+                if not spend_recorded:
+                    self.ledger.release(reservation_id)
                 if ssh_key_dir and ssh_key_dir.exists():
                     shutil.rmtree(ssh_key_dir, ignore_errors=True)
-
-            elapsed_secs = max(0.0, self.clock() - started_at)
-            balance_after = balance_before
-            try:
-                balance_after = self.driver.get_balance()
-            except Exception:
-                pass
-            observed_delta = max(0.0, round(balance_before - balance_after, 6))
-            est_runtime_usd = round(est.hourly_rate_usd * (elapsed_secs / 3600.0), 6)
-            recorded_usd = observed_delta if observed_delta > 0 else min(est.estimated_max_usd, est_runtime_usd)
-            budget_after = self.ledger.record_spend(
-                owned_name,
-                recorded_usd,
-                meta={"mode": spec.mode, "resource_id": launch.resource_id, "state": final_state},
-            )
 
             if final_output is not None and "output.json" not in artifact_files and len(artifact_files) < 4:
                 artifact_files["output.json"] = json.dumps(final_output, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
@@ -648,12 +707,16 @@ class ColumbusController:
                 if dry_run:
                     return {"ok": True, "dry_run": True, "candidates": candidates, "reaped": [], "skipped": skipped}
                 spec = JobSpec(mode=str(intent.get("mode") or "pod"), endpoint_id=str(intent.get("endpoint_id") or ""))
+                if not owned_name.startswith(OWNED_PREFIX):
+                    self._quarantine("malformed_intent_owned_name", {"owned_name": owned_name})
+                    return {"ok": False, "dry_run": False, "candidates": candidates, "reaped": [], "skipped": skipped, "quarantined": True}
                 owned_now = [r for r in self.driver.list_owned(OWNED_PREFIX) if r.name == owned_name]
-                if not owned_now and not resource_id:
+                if not owned_now:
+                    # Provider confirms zero owned resources with this exact tag; clear stale intent without blind terminate
                     intent_path.unlink()
                     reaped.append(owned_name)
                     return {"ok": True, "dry_run": False, "candidates": candidates, "reaped": reaped, "skipped": skipped}
-                target_ids = [r.resource_id for r in owned_now] or ([resource_id] if resource_id else [])
+                target_ids = [r.resource_id for r in owned_now]
                 all_clean = True
                 for rid in target_ids:
                     if not self._cleanup_owned(rid, owned_name, spec):

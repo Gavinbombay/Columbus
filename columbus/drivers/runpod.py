@@ -34,6 +34,7 @@ DEFAULT_SERVERLESS_BASE_URL = "https://api.runpod.ai/v2"
 DEFAULT_KEY_FILE = Path.home() / ".config" / "columbus" / "runpod_api_key"
 DEFAULT_SERVERLESS_CONSERVATIVE_HOURLY_USD = 2.50
 MAX_CAPTURED_LOG_BYTES = 2 * 1024 * 1024  # 2 MiB per stream
+MAX_HTTP_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MiB API response cap
 
 TRANSIENT_ALLOC_MARKERS = (
     "no longer any instances available",
@@ -82,7 +83,10 @@ class RunPodDriver(ProviderDriver):
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(req, timeout=self.http_timeout_secs) as resp:
-                raw = resp.read().decode("utf-8")
+                raw_bytes = resp.read(MAX_HTTP_RESPONSE_BYTES + 1)
+                if len(raw_bytes) > MAX_HTTP_RESPONSE_BYTES:
+                    raise DriverError("runpod_response_size_limit")
+                raw = raw_bytes.decode("utf-8")
         except urllib.error.HTTPError as exc:
             err_body = ""
             try:
@@ -374,11 +378,11 @@ class RunPodDriver(ProviderDriver):
 
         raise DriverError(f"unsupported_mode:{spec.mode}")
 
-    def _ssh_base_cmd(self, ssh_endpoint: Tuple[str, int], private_key_path: Path) -> List[str]:
+    def _ssh_base_cmd(self, ssh_endpoint: Tuple[str, int], identity_path: Path) -> List[str]:
         host, port = ssh_endpoint
         return [
             "ssh",
-            "-i", str(private_key_path),
+            "-i", str(identity_path),
             "-p", str(port),
             "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
@@ -393,11 +397,11 @@ class RunPodDriver(ProviderDriver):
     def _wait_for_sshd(
         self,
         ssh_endpoint: Tuple[str, int],
-        private_key_path: Path,
+        identity_path: Path,
         deadline: float,
         is_cancelled: Optional[Callable[[], bool]] = None,
     ) -> bool:
-        probe_cmd = self._ssh_base_cmd(ssh_endpoint, private_key_path) + ["true"]
+        probe_cmd = self._ssh_base_cmd(ssh_endpoint, identity_path) + ["true"]
         while time.time() < deadline:
             if is_cancelled and is_cancelled():
                 return False
@@ -410,7 +414,7 @@ class RunPodDriver(ProviderDriver):
     def run_pod_command(
         self,
         ssh_endpoint: Tuple[str, int],
-        private_key_path: Path,
+        identity_path: Path,
         spec: JobSpec,
         walltime_remaining_secs: float,
         is_cancelled: Optional[Callable[[], bool]] = None,
@@ -418,14 +422,14 @@ class RunPodDriver(ProviderDriver):
         start = time.time()
         hard_deadline = start + max(10.0, walltime_remaining_secs)
         sshd_deadline = min(hard_deadline, start + 60.0)
-        if not self._wait_for_sshd(ssh_endpoint, private_key_path, sshd_deadline, is_cancelled=is_cancelled):
+        if not self._wait_for_sshd(ssh_endpoint, identity_path, sshd_deadline, is_cancelled=is_cancelled):
             if is_cancelled and is_cancelled():
                 return ExecResult(state="cancelled", error="cancelled_during_sshd_wait")
             return ExecResult(state="failed", error="sshd_connect_timeout")
 
         script_b64 = base64.b64encode(spec.command.encode("utf-8")).decode("ascii")
         remote_cmd = f"echo {script_b64} | base64 -d > /tmp/columbus_run.sh && chmod +x /tmp/columbus_run.sh && bash /tmp/columbus_run.sh"
-        full_cmd = self._ssh_base_cmd(ssh_endpoint, private_key_path) + [remote_cmd]
+        full_cmd = self._ssh_base_cmd(ssh_endpoint, identity_path) + [remote_cmd]
 
         proc = subprocess.Popen(
             full_cmd,
@@ -503,10 +507,34 @@ class RunPodDriver(ProviderDriver):
         if rc == 0 and spec.files_out:
             for remote_path in spec.files_out:
                 base_name = validate_artifact_name(Path(remote_path).name)
-                cat_cmd = self._ssh_base_cmd(ssh_endpoint, private_key_path) + [f"cat -- {shlex.quote(remote_path)}"]
-                fres = subprocess.run(cat_cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=60)
-                if fres.returncode == 0 and len(fres.stdout) <= MAX_FILE_BYTES:
-                    files_out_bytes[base_name] = fres.stdout
+                cat_cmd = self._ssh_base_cmd(ssh_endpoint, identity_path) + [f"cat -- {shlex.quote(remote_path)}"]
+                fproc = subprocess.Popen(cat_cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+                assert fproc.stdout is not None
+                fbuf = bytearray()
+                oversized = False
+                try:
+                    while True:
+                        chunk = fproc.stdout.read(65536)
+                        if not chunk:
+                            break
+                        if len(fbuf) + len(chunk) > MAX_FILE_BYTES:
+                            oversized = True
+                            try:
+                                os.killpg(fproc.pid, signal.SIGKILL)
+                            except OSError:
+                                pass
+                            break
+                        fbuf.extend(chunk)
+                    frc = fproc.wait(timeout=30)
+                finally:
+                    if fproc.poll() is None:
+                        try:
+                            os.killpg(fproc.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                        fproc.wait(timeout=5)
+                if not oversized and frc == 0:
+                    files_out_bytes[base_name] = bytes(fbuf)
 
         return ExecResult(
             state="completed" if rc == 0 else "failed",
