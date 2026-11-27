@@ -130,7 +130,11 @@ class ProviderDriver(ABC):
 
     @abstractmethod
     def list_owned(self, prefix: str) -> List[OwnedResource]:
-        """Return ONLY resources whose name starts with prefix."""
+        """Discover name-prefixed pods; the result alone is not proof of ownership."""
+
+    @abstractmethod
+    def get_pod(self, resource_id: str) -> Optional[OwnedResource]:
+        """Find a pod by exact provider ID, including pods outside the owned prefix."""
 
     @abstractmethod
     def create(self, spec: JobSpec, owned_name: str, ssh_public_key: Optional[str] = None) -> LaunchResult:

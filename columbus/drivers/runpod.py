@@ -203,6 +203,15 @@ class RunPodDriver(ProviderDriver):
     def list_owned(self, prefix: str) -> List[OwnedResource]:
         if not prefix or not prefix.startswith("diffuser-columbus-"):
             raise DriverError("invalid_owned_prefix")
+        return self._list_pods(prefix)
+
+    def get_pod(self, resource_id: str) -> Optional[OwnedResource]:
+        matches = [pod for pod in self._list_pods("") if pod.resource_id == resource_id]
+        if len(matches) > 1:
+            raise DriverError("runpod_pod_id_ambiguous")
+        return matches[0] if matches else None
+
+    def _list_pods(self, prefix: str) -> List[OwnedResource]:
         data = self._graphql(
             "{ myself { pods { id name desiredStatus runtime { uptimeInSeconds } } } }"
         )
@@ -210,8 +219,6 @@ class RunPodDriver(ProviderDriver):
         if not isinstance(myself, dict):
             raise DriverError("runpod_pods_list_ambiguous")
         pods = myself.get("pods")
-        if pods is None:
-            return []
         if not isinstance(pods, list):
             raise DriverError("runpod_pods_list_ambiguous")
         owned: List[OwnedResource] = []
@@ -221,10 +228,13 @@ class RunPodDriver(ProviderDriver):
             name = str(pod.get("name") or "")
             if not name.startswith(prefix):
                 continue
+            resource_id = pod.get("id")
+            if not isinstance(resource_id, str) or not resource_id:
+                raise DriverError("runpod_pod_id_ambiguous")
             runtime = pod.get("runtime") if isinstance(pod.get("runtime"), dict) else {}
             owned.append(
                 OwnedResource(
-                    resource_id=str(pod.get("id") or ""),
+                    resource_id=resource_id,
                     name=name,
                     status=str(pod.get("desiredStatus") or "UNKNOWN"),
                     uptime_secs=int(runtime.get("uptimeInSeconds") or 0),
@@ -276,10 +286,10 @@ class RunPodDriver(ProviderDriver):
             """
             data = self._graphql(query, {"input": pod_input})
             pod = data.get("podFindAndDeployOnDemand")
-            if not isinstance(pod, dict) or not pod.get("id"):
+            if not isinstance(pod, dict) or not isinstance(pod.get("id"), str) or not pod["id"]:
                 raise DriverError("runpod_pod_create_missing_id")
             return LaunchResult(
-                resource_id=str(pod["id"]),
+                resource_id=pod["id"],
                 name=str(pod.get("name") or owned_name),
                 status=str(pod.get("desiredStatus") or "CREATED"),
                 raw_meta={"machine_id": pod.get("machineId")},
@@ -291,10 +301,10 @@ class RunPodDriver(ProviderDriver):
             url = f"{self.serverless_base_url}/{spec.endpoint_id}/run"
             resp = self._http_json(url, method="POST", body={"input": spec.payload})
             job_id = resp.get("id")
-            if not job_id:
+            if not isinstance(job_id, str) or not job_id:
                 raise DriverError("runpod_serverless_missing_job_id")
             return LaunchResult(
-                resource_id=str(job_id),
+                resource_id=job_id,
                 name=owned_name,
                 status=str(resp.get("status") or "IN_QUEUE"),
             )

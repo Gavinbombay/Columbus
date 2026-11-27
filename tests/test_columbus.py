@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from pathlib import Path
 
 from columbus.controller import ColumbusController, LaneConfig
-from columbus.drivers.base import DriverError, OwnedResource, PollResult
+from columbus.drivers.base import DriverError, JobSpec, OwnedResource, PollResult, TransientAllocationError
 from columbus.drivers.fake import FakeRunPodDriver
 from columbus.drivers.runpod import RunPodDriver
 from columbus.secure_io import atomic_write_json
@@ -206,6 +206,188 @@ class ColumbusControllerTests(unittest.TestCase):
         self.assertIn("foreign-1", drv.pods)
         self.assertFalse(intent_path.exists())
 
+    def _orphan_intent(self, ctrl, resource_id, name, **overrides):
+        intent_path = ctrl.lane_dir / "seat-0.intent.json"
+        atomic_write_json(intent_path, {
+            "pid": 99999999,
+            "lane_id": ctrl.config.lane_id,
+            "owned_name": name,
+            "mode": "pod",
+            "resource_id": resource_id,
+            **overrides,
+        })
+        return intent_path
+
+    def test_reaper_preserves_same_name_pods(self) -> None:
+        name = "diffuser-columbus-orphan-g1"
+        orphan = OwnedResource("owned-id", name, "RUNNING")
+        foreign = OwnedResource("other-id", name, "RUNNING")
+        ctrl, drv = self._make_controller(FakeRunPodDriver(foreign_pods=[foreign, orphan]))
+        intent_path = self._orphan_intent(ctrl, orphan.resource_id, name)
+        self.assertTrue(ctrl.reap()["ok"])
+        self.assertEqual(drv.terminate_calls, [orphan.resource_id])
+        self.assertEqual(drv.pods, {foreign.resource_id: foreign})
+        self.assertFalse(intent_path.exists())
+        self.assertFalse(ctrl.quarantine_path.exists())
+
+    def test_reaper_absent_recorded_id_preserves_same_name_pods(self) -> None:
+        name = "diffuser-columbus-orphan-g1"
+        foreign = OwnedResource("other-id", name, "RUNNING")
+        ctrl, drv = self._make_controller(FakeRunPodDriver(foreign_pods=[foreign]))
+        intent_path = self._orphan_intent(ctrl, "gone-id", name)
+        self.assertTrue(ctrl.reap()["ok"])
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertEqual(drv.pods, {foreign.resource_id: foreign})
+        self.assertFalse(intent_path.exists())
+
+    def test_reaper_missing_or_invalid_id_retains_intent(self) -> None:
+        name = "diffuser-columbus-orphan-g1"
+        foreign = OwnedResource("other-id", name, "RUNNING")
+        ctrl, drv = self._make_controller(FakeRunPodDriver(foreign_pods=[foreign]))
+        for resource_id in (None, "", 42):
+            with self.subTest(resource_id=resource_id):
+                intent_path = self._orphan_intent(ctrl, resource_id, name)
+                self.assertFalse(ctrl.reap()["ok"])
+                self.assertEqual(drv.terminate_calls, [])
+                self.assertEqual(drv.pods, {foreign.resource_id: foreign})
+                self.assertTrue(intent_path.exists())
+                self.assertTrue(ctrl.quarantine_path.exists())
+
+    def test_reaper_renamed_recorded_id_quarantines(self) -> None:
+        name = "diffuser-columbus-orphan-g1"
+        renamed = OwnedResource("owned-id", "different-name", "RUNNING")
+        foreign = OwnedResource("other-id", name, "RUNNING")
+        ctrl, drv = self._make_controller(FakeRunPodDriver(foreign_pods=[renamed, foreign]))
+        intent_path = self._orphan_intent(ctrl, renamed.resource_id, name)
+        self.assertFalse(ctrl.reap()["ok"])
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertEqual(drv.pods, {renamed.resource_id: renamed, foreign.resource_id: foreign})
+        self.assertTrue(intent_path.exists())
+        self.assertTrue(ctrl.quarantine_path.exists())
+
+    def test_reaper_preserves_live_pid_intent(self) -> None:
+        name = "diffuser-columbus-orphan-g1"
+        pod = OwnedResource("owned-id", name, "RUNNING")
+        ctrl, drv = self._make_controller(FakeRunPodDriver(foreign_pods=[pod]))
+        intent_path = self._orphan_intent(ctrl, pod.resource_id, name, pid=os.getpid())
+        self.assertTrue(ctrl.reap()["ok"])
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertTrue(intent_path.exists())
+        self.assertFalse(ctrl.quarantine_path.exists())
+
+    def test_reaper_lookup_failure_retains_intent(self) -> None:
+        ctrl, drv = self._make_controller()
+        intent_path = self._orphan_intent(ctrl, "owned-id", "diffuser-columbus-orphan-g1")
+        with patch.object(drv, "get_pod", side_effect=DriverError("lookup_failed")):
+            self.assertFalse(ctrl.reap()["ok"])
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertTrue(intent_path.exists())
+        self.assertTrue(ctrl.quarantine_path.exists())
+
+    def test_reaper_failed_termination_retains_intent(self) -> None:
+        pod = OwnedResource("owned-id", "diffuser-columbus-orphan-g1", "RUNNING")
+        ctrl, drv = self._make_controller(FakeRunPodDriver(foreign_pods=[pod], fail_terminate=True))
+        intent_path = self._orphan_intent(ctrl, pod.resource_id, pod.name)
+        self.assertFalse(ctrl.reap()["ok"])
+        self.assertEqual(drv.terminate_calls, [pod.resource_id])
+        self.assertTrue(intent_path.exists())
+        self.assertTrue(ctrl.quarantine_path.exists())
+
+    def test_serverless_reaper_cancels_only_recorded_job(self) -> None:
+        name = "diffuser-columbus-orphan-g1"
+        foreign = OwnedResource("other-id", name, "RUNNING")
+        ctrl, drv = self._make_controller(FakeRunPodDriver(foreign_pods=[foreign]))
+        intent_path = self._orphan_intent(ctrl, "job-id", name, mode="serverless", endpoint_id="endpoint-id")
+        with patch.object(drv, "terminate", wraps=drv.terminate) as terminate:
+            self.assertTrue(ctrl.reap()["ok"])
+            terminate.assert_called_once()
+            resource_id, spec = terminate.call_args.args
+            self.assertEqual(resource_id, "job-id")
+            self.assertEqual(spec.endpoint_id, "endpoint-id")
+            self.assertEqual(spec.mode, "serverless")
+        self.assertEqual(drv.pods, {foreign.resource_id: foreign})
+        self.assertFalse(intent_path.exists())
+
+    def test_serverless_reaper_missing_endpoint_retains_intent(self) -> None:
+        ctrl, drv = self._make_controller()
+        intent_path = self._orphan_intent(ctrl, "job-id", "diffuser-columbus-orphan-g1", mode="serverless")
+        self.assertFalse(ctrl.reap()["ok"])
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertTrue(intent_path.exists())
+        self.assertTrue(ctrl.quarantine_path.exists())
+
+    def test_transient_allocation_name_collision_never_authorizes_termination(self) -> None:
+        ctrl, drv = self._make_controller()
+        staged = ctrl.handle({"action": "stage", "max_usd": 0.25, "max_walltime_secs": 300})
+        ctrl.approvals.approve(staged["ticket_id"])
+
+        def allocation_failure(spec, owned_name, ssh_public_key=None):
+            drv.pods["other-id"] = OwnedResource("other-id", owned_name, "RUNNING")
+            raise TransientAllocationError("capacity")
+
+        with patch.object(drv, "create", side_effect=allocation_failure) as create:
+            res = ctrl.handle({"action": "exec", "ticket_id": staged["ticket_id"], "max_usd": 0.25, "max_walltime_secs": 300})
+        self.assertFalse(res["ok"])
+        self.assertFalse(res["cleanup_verified"])
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertIn("other-id", drv.pods)
+        self.assertTrue((ctrl.lane_dir / "seat-0.intent.json").exists())
+        self.assertTrue(ctrl.quarantine_path.exists())
+
+    def test_second_transient_allocation_failure_with_no_resources_clears_intent(self) -> None:
+        ctrl, drv = self._make_controller(FakeRunPodDriver(transient_failures_before_success=2))
+        staged = ctrl.handle({"action": "stage", "max_usd": 0.25, "max_walltime_secs": 300})
+        ctrl.approvals.approve(staged["ticket_id"])
+        res = ctrl.handle({"action": "exec", "ticket_id": staged["ticket_id"], "max_usd": 0.25, "max_walltime_secs": 300})
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["cleanup_verified"])
+        self.assertEqual(res["attempts"], 2)
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertFalse((ctrl.lane_dir / "seat-0.intent.json").exists())
+        self.assertFalse(ctrl.quarantine_path.exists())
+
+    def test_ambiguous_create_failure_retains_intent(self) -> None:
+        ctrl, drv = self._make_controller()
+        staged = ctrl.handle({"action": "stage", "max_usd": 0.25, "max_walltime_secs": 300})
+        ctrl.approvals.approve(staged["ticket_id"])
+        with patch.object(drv, "create", side_effect=DriverError("create_response_unavailable")):
+            res = ctrl.handle({"action": "exec", "ticket_id": staged["ticket_id"], "max_usd": 0.25, "max_walltime_secs": 300})
+        self.assertFalse(res["ok"])
+        self.assertEqual(drv.terminate_calls, [])
+        self.assertTrue((ctrl.lane_dir / "seat-0.intent.json").exists())
+        self.assertTrue(ctrl.quarantine_path.exists())
+
+    def test_reaper_requires_confirmed_absence_after_termination(self) -> None:
+        name = "diffuser-columbus-orphan-g1"
+        pod = OwnedResource("owned-id", name, "RUNNING")
+        foreign = OwnedResource("other-id", name, "RUNNING")
+        ctrl, drv = self._make_controller(FakeRunPodDriver(foreign_pods=[pod, foreign], leave_orphan_after_terminate=True))
+        intent_path = self._orphan_intent(ctrl, pod.resource_id, name)
+        self.assertFalse(ctrl.reap()["ok"])
+        self.assertEqual(drv.terminate_calls, [pod.resource_id])
+        self.assertEqual(drv.pods, {pod.resource_id: pod, foreign.resource_id: foreign})
+        self.assertTrue(intent_path.exists())
+        self.assertTrue(ctrl.quarantine_path.exists())
+
+    def test_execute_cleanup_ignores_name_collision(self) -> None:
+        ctrl, drv = self._make_controller()
+        staged = ctrl.handle({"action": "stage", "max_usd": 0.25, "max_walltime_secs": 300})
+        ctrl.approvals.approve(staged["ticket_id"])
+        original_create = drv.create
+
+        def create_with_other_pod(spec, owned_name, ssh_public_key=None):
+            drv.pods["other-id"] = OwnedResource("other-id", owned_name, "RUNNING")
+            return original_create(spec, owned_name, ssh_public_key)
+
+        with patch.object(drv, "create", side_effect=create_with_other_pod):
+            res = ctrl.handle({"action": "exec", "ticket_id": staged["ticket_id"], "max_usd": 0.25, "max_walltime_secs": 300})
+        self.assertTrue(res["ok"])
+        self.assertTrue(res["cleanup_verified"])
+        self.assertEqual(drv.terminate_calls, [res["resource_id"]])
+        self.assertIn("other-id", drv.pods)
+        self.assertFalse(ctrl.quarantine_path.exists())
+
     def test_dynamic_key_rotation_and_permission_guard(self) -> None:
         ctrl, drv = self._make_controller()
         self.assertTrue(ctrl.handle({"action": "status"})["ok"])
@@ -332,9 +514,11 @@ class ColumbusAuditHardeningTests(unittest.TestCase):
             "resource_id": "foreign-victim-1",
         })
         res = ctrl.reap(dry_run=False)
-        self.assertTrue(res["ok"])
+        self.assertFalse(res["ok"])
         self.assertEqual(drv.terminate_calls, [])
         self.assertIn("foreign-victim-1", drv.pods)
+        self.assertTrue(ctrl.quarantine_path.exists())
+        self.assertTrue((ctrl.lane_dir / "seat-0.intent.json").exists())
 
     def test_nv4_symlink_api_key_rejected(self) -> None:
         sym = self.root / "symlink_key"
@@ -367,3 +551,32 @@ class ColumbusAuditHardeningTests(unittest.TestCase):
                 driver._http_json("https://api.runpod.io/graphql")
 
         self.assertEqual(body.requested, [301])
+
+    def test_runpod_get_pod_exact_id_and_missing_id(self) -> None:
+        driver = RunPodDriver(key_file=self.key_file)
+        pods = [
+            {"id": "first", "name": "diffuser-columbus-pod"},
+            {"id": "second", "name": "diffuser-columbus-pod"},
+            {"id": "third", "name": "renamed-pod"},
+        ]
+        with patch.object(driver, "_graphql", return_value={"myself": {"pods": pods}}):
+            self.assertEqual(driver.get_pod("second").resource_id, "second")
+            self.assertEqual(driver.get_pod("third").name, "renamed-pod")
+            self.assertIsNone(driver.get_pod("absent"))
+            self.assertEqual(len(driver.list_owned("diffuser-columbus-")), 2)
+
+    def test_runpod_get_pod_rejects_ambiguous_inventory(self) -> None:
+        driver = RunPodDriver(key_file=self.key_file)
+        for pods in (None, [{}], [{"id": "same"}, {"id": "same"}]):
+            with self.subTest(pods=pods):
+                with patch.object(driver, "_graphql", return_value={"myself": {"pods": pods}}):
+                    with self.assertRaises(DriverError):
+                        driver.get_pod("same")
+
+    def test_runpod_serverless_cancel_uses_endpoint_and_job_id(self) -> None:
+        driver = RunPodDriver(key_file=self.key_file)
+        with patch.object(driver, "_http_json", return_value={"status": "CANCELLED"}) as http:
+            driver.terminate("job-id", JobSpec(mode="serverless", endpoint_id="endpoint-id"))
+            http.assert_called_once_with(
+                f"{driver.serverless_base_url}/endpoint-id/cancel/job-id", method="POST", body={},
+            )

@@ -12,8 +12,8 @@ Columbus runs as a standalone external fleet-worker adapter for [Diffuser](https
   - Cumulative USD budget ledger with atomic multi-lane reservations (`flock` + `0600` atomic writes).
   - Live account balance floor and per-job `max_usd` ceiling.
   - Dynamic per-job API key loading (`O_NOFOLLOW` + `fstat` `0600` check) so API keys rotate without restarting the worker.
-  - 1x backoff retry on `$0` transient allocation failures after verifying zero spend and zero owned pods.
-  - Owned-only resource tagging (`diffuser-columbus-<lane>-<nonce>-g<n>`), guaranteed teardown, absence verification, lane quarantine on ambiguous cleanup, and an automated orphan reaper (`columbus_ctl.py reap`).
+  - 1x backoff retry on `$0` transient allocation failures after checking unchanged balance and absence of matching pod names; name matches never authorize cleanup.
+  - Resource tagging (`diffuser-columbus-<lane>-<nonce>-g<n>`), ID-bound teardown and absence verification, lane quarantine on ambiguous cleanup, and an automated orphan reaper (`columbus_ctl.py reap`).
   - Optional RunPod Network Volume attachment and `HF_HUB_DISABLE_XET=1` default for large model weights.
 
 ## Quick Start
@@ -23,7 +23,7 @@ Columbus runs as a standalone external fleet-worker adapter for [Diffuser](https
 install -d -m 700 ~/.config/columbus
 umask 077 && printf "%s\n" "<YOUR_RUNPOD_API_KEY>" > ~/.config/columbus/runpod_api_key
 
-# 2. Run the offline deterministic test suite (no network calls)
+# 2. Run the 32 offline deterministic unit tests (no network calls)
 python3 -m unittest discover -s tests -v
 
 # 3. Check live RunPod balance, owned pods, and budget ledger (read-only)
@@ -37,5 +37,7 @@ python3 -m unittest discover -s tests -v
 ## Diffuser Fleet Enrollment
 
 Add `columbus_worker.py` as an `exec` profile in your Diffuser fleet-worker config advertising `columbus.runpod.pod.exec/v1` and/or `columbus.runpod.serverless.exec/v1`, then submit standard `"async": true` jobs to Diffuser with `action: "status"`, `"estimate"`, `"stage"`, or `"exec"`.
+
+If creation is interrupted before a provider ID is recorded, the reaper retains the intent and quarantines the lane. The owner must independently establish custody and reconcile provider state before resolving the intent. A matching pod name is not sufficient evidence.
 
 See [DESIGN.md](DESIGN.md), [AUDIT.md](AUDIT.md), and [docs/SECURITY.md](docs/SECURITY.md) for architecture and security details.

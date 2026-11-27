@@ -90,6 +90,10 @@ class FakeRunPodDriver(ProviderDriver):
             raise DriverError("invalid_owned_prefix")
         return [p for p in self.pods.values() if p.name.startswith(prefix)]
 
+    def get_pod(self, resource_id: str) -> Optional[OwnedResource]:
+        self._check_key()
+        return self.pods.get(resource_id)
+
     def create(
         self,
         spec: JobSpec,

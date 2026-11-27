@@ -20,8 +20,14 @@
    - Provider-verified owned-only reaper teardown (no unverified intent ID fallback).
    - Race-free `O_NOFOLLOW` + `fstat()` `0600` API key loading and ephemeral SSH key cleanup inside `try/finally`.
 
-## Isolated Sandbox Validation
+## Historical Isolated Sandbox Validation
 
 - Executed in OS-enforced `bwrap` sandbox (`--ro-bind / / --dev /dev --tmpfs /tmp --unshare-net --clearenv --setenv PATH /usr/bin:/bin --die-with-parent`): **`15/15` unit tests passing** with zero warnings and zero network access.
 - Static checks: AST parse passed on all 12 Python files; `git diff --check` clean.
 - Public hygiene scan (`gen85`): `0` raw hits, `0` unruled hits, `0` namegrep hits.
+
+## Release Candidate Validation (`9dab877`)
+
+- All 32 unit tests passed in an OS-enforced networkless sandbox.
+- The suite covers ID-bound pod reaping, exact name verification, preservation of same-name pods, missing or ambiguous IDs, post-termination absence verification, and serverless cancellation by recorded endpoint and job ID.
+- This validation supplements the historical audit above; it is not a new full security audit.

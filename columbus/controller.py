@@ -385,23 +385,43 @@ class ColumbusController:
             "approval_command": f"columbus_ctl.py approve {tid}",
         }
 
-    def _verify_zero_owned(self, owned_name: str) -> bool:
-        remaining = [r for r in self.driver.list_owned(OWNED_PREFIX) if r.name == owned_name]
-        return len(remaining) == 0
-
-    def _cleanup_owned(self, resource_id: str, owned_name: str, spec: JobSpec) -> bool:
+    def _cleanup_owned(
+        self, resource_id: str, owned_name: str, spec: JobSpec, *, created_here: bool = False,
+    ) -> bool:
+        details = {"resource_id": resource_id, "owned_name": owned_name}
+        if (not isinstance(resource_id, str) or not resource_id
+                or not isinstance(owned_name, str) or not owned_name.startswith(OWNED_PREFIX)):
+            self._quarantine("cleanup_ownership_unverified", details)
+            return False
+        if spec.mode == "pod":
+            # A successful create response already binds the ID in this execution.
+            # Recovered intents additionally require provider name corroboration.
+            if not created_here:
+                try:
+                    pod = self.driver.get_pod(resource_id)
+                    if pod is None:
+                        return True
+                    if pod.resource_id != resource_id or pod.name != owned_name:
+                        self._quarantine("cleanup_ownership_mismatch", details)
+                        return False
+                except Exception:
+                    self._quarantine("cleanup_ownership_unverified", details)
+                    return False
+        elif spec.mode != "serverless" or not isinstance(spec.endpoint_id, str) or not spec.endpoint_id:
+            self._quarantine("cleanup_ownership_unverified", details)
+            return False
         try:
             self.driver.terminate(resource_id, spec)
         except Exception as exc:
-            self._quarantine("terminate_failed", {"resource_id": resource_id, "owned_name": owned_name, "error": str(exc)})
+            self._quarantine("terminate_failed", {**details, "error": str(exc)})
             return False
         if spec.mode == "pod":
             try:
-                if not self._verify_zero_owned(owned_name):
-                    self._quarantine("owned_pod_still_present", {"resource_id": resource_id, "owned_name": owned_name})
+                if self.driver.get_pod(resource_id) is not None:
+                    self._quarantine("owned_pod_still_present", details)
                     return False
-            except Exception as exc:
-                self._quarantine("cleanup_verify_ambiguous", {"resource_id": resource_id, "owned_name": owned_name, "error": str(exc)})
+            except Exception:
+                self._quarantine("cleanup_verify_ambiguous", details)
                 return False
         return True
 
@@ -501,9 +521,28 @@ class ColumbusController:
                         launch = self.driver.create(spec, owned_name, ssh_public_key=ssh_pub_key)
                         break
                     except TransientAllocationError:
+                        if attempts < 2:
+                            self.sleeper(self.config.alloc_retry_delay_secs)
+                        # Names can block a retry, but cannot authorize deletion.
+                        # Preserve the unresolved intent if allocation is ambiguous.
+                        try:
+                            recheck_bal = self.driver.get_balance()
+                            owned_now = [r for r in self.driver.list_owned(OWNED_PREFIX) if r.name == owned_name]
+                        except Exception:
+                            self._quarantine("allocation_ownership_unverified", {"owned_name": owned_name})
+                            raise
+                        if (spec.mode != "pod" or abs(recheck_bal - balance_before) > 1e-6
+                                or owned_now or recheck_bal < self.config.min_balance_floor_usd):
+                            self._quarantine("allocation_ownership_unverified", {"owned_name": owned_name})
+                            return {
+                                "ok": False,
+                                "lane_id": self.config.lane_id,
+                                "error": "allocation_retry_aborted",
+                                "attempts": attempts,
+                                "cleanup_verified": False,
+                            }
                         if attempts >= 2:
-                            if intent_path.exists():
-                                intent_path.unlink()
+                            intent_path.unlink()
                             return {
                                 "ok": False,
                                 "lane_id": self.config.lane_id,
@@ -511,29 +550,16 @@ class ColumbusController:
                                 "attempts": attempts,
                                 "cleanup_verified": True,
                             }
-                        self.sleeper(self.config.alloc_retry_delay_secs)
-                        recheck_bal = self.driver.get_balance()
-                        owned_now = [r for r in self.driver.list_owned(OWNED_PREFIX) if r.name == owned_name]
-                        if abs(recheck_bal - balance_before) > 1e-6 or owned_now or recheck_bal < self.config.min_balance_floor_usd:
-                            if owned_now:
-                                for r in owned_now:
-                                    self._cleanup_owned(r.resource_id, owned_name, spec)
-                            if intent_path.exists() and not self.quarantine_path.exists():
-                                intent_path.unlink()
-                            return {
-                                "ok": False,
-                                "lane_id": self.config.lane_id,
-                                "error": "allocation_retry_aborted",
-                                "attempts": attempts,
-                            }
                         owned_name = f"{OWNED_PREFIX}{self.config.lane_id}-{job_nonce}-g2"
                         intent["owned_name"] = owned_name
                         atomic_write_json(intent_path, intent)
                     except Exception:
-                        if intent_path.exists():
-                            intent_path.unlink()
+                        self._quarantine("allocation_ownership_unverified", {"owned_name": owned_name})
                         raise
 
+                if not isinstance(launch.resource_id, str) or not launch.resource_id:
+                    self._quarantine("allocation_ownership_unverified", {"owned_name": owned_name})
+                    raise Refusal("allocation_missing_resource_id")
                 intent["resource_id"] = launch.resource_id
                 atomic_write_json(intent_path, intent)
 
@@ -623,7 +649,7 @@ class ColumbusController:
                             self.sleeper(self.config.job_poll_secs)
                 finally:
                     if spec.mode == "pod" or final_state not in ("completed", "failed", "cancelled", "timed_out"):
-                        cleanup_verified = self._cleanup_owned(launch.resource_id, owned_name, spec)
+                        cleanup_verified = self._cleanup_owned(launch.resource_id, owned_name, spec, created_here=True)
                     else:
                         cleanup_verified = True
                     if cleanup_verified and intent_path.exists():
@@ -698,29 +724,21 @@ class ColumbusController:
                     return {"ok": True, "dry_run": dry_run, "candidates": [], "reaped": [], "skipped": []}
                 intent = read_json(intent_path)
                 pid = int(intent.get("pid") or 0)
-                owned_name = str(intent.get("owned_name") or "")
-                resource_id = str(intent.get("resource_id") or "")
+                owned_name = intent.get("owned_name")
+                resource_id = intent.get("resource_id")
                 if pid_is_alive(pid):
                     skipped.append({"owned_name": owned_name, "reason": "pid_alive", "pid": pid})
                     return {"ok": True, "dry_run": dry_run, "candidates": [], "reaped": [], "skipped": skipped}
                 candidates.append({"owned_name": owned_name, "resource_id": resource_id, "pid": pid})
                 if dry_run:
                     return {"ok": True, "dry_run": True, "candidates": candidates, "reaped": [], "skipped": skipped}
-                spec = JobSpec(mode=str(intent.get("mode") or "pod"), endpoint_id=str(intent.get("endpoint_id") or ""))
-                if not owned_name.startswith(OWNED_PREFIX):
+                spec = JobSpec(mode=intent.get("mode", "pod"), endpoint_id=intent.get("endpoint_id", ""))
+                if not isinstance(owned_name, str) or not owned_name.startswith(OWNED_PREFIX):
                     self._quarantine("malformed_intent_owned_name", {"owned_name": owned_name})
                     return {"ok": False, "dry_run": False, "candidates": candidates, "reaped": [], "skipped": skipped, "quarantined": True}
-                owned_now = [r for r in self.driver.list_owned(OWNED_PREFIX) if r.name == owned_name]
-                if not owned_now:
-                    # Provider confirms zero owned resources with this exact tag; clear stale intent without blind terminate
-                    intent_path.unlink()
-                    reaped.append(owned_name)
-                    return {"ok": True, "dry_run": False, "candidates": candidates, "reaped": reaped, "skipped": skipped}
-                target_ids = [r.resource_id for r in owned_now]
-                all_clean = True
-                for rid in target_ids:
-                    if not self._cleanup_owned(rid, owned_name, spec):
-                        all_clean = False
+                # The durable create receipt is the authority. A matching name
+                # is only corroboration for pods, never a way to discover an ID.
+                all_clean = self._cleanup_owned(resource_id, owned_name, spec)
                 if all_clean and intent_path.exists():
                     intent_path.unlink()
                     reaped.append(owned_name)
